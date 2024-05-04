@@ -153,93 +153,113 @@ def calculate_loss_and_mae(model, criterion, mae_criterion, inputs, targets, use
     mae = mae_criterion(outputs, targets.unsqueeze(0))
     return loss, mae
 
+# Candidate window sizes
+window_sizes = [2, 4, 6]
+
 # Lists for each fold's losses
 all_train_losses, all_val_losses, all_train_maes, all_val_maes, losses, maes = [], [], [], [], [], []
 all_filtered_train_losses, all_filtered_val_losses, all_filtered_train_maes, all_filtered_val_maes, filtered_losses, filtered_maes = [], [], [], [], [], []
 
-for train_index, test_index in tscv.split(features_tensor):
-    # Splitting data into train, val and test
-    X_train_val, X_test = features_tensor[train_index], features_tensor[test_index]
-    y_train_val, y_test = labels_tensor[train_index], labels_tensor[test_index]
-    
-    # Validation set
-    X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.2, shuffle=False)
-    
-    # DataLoader for online learning
-    # TensorDataset from data
-    train_dataset = TensorDataset(X_train, y_train)
-    # DataLoader from TensorDataset
-    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+# Group by subject for applying tss on each subject
+grouped = data.groupby('subject')
 
-    # Model's instance with best params
-    model = StressLSTM(input_size, hidden_size, num_layers, dropout_rate_1, dropout_rate_2, dropout_rate_fc)
+# Time series split on each group
+for name, group in grouped:
+    features = group.drop(["game_section", "stress_label", "subject"], axis=1)
+    labels = group["stress_label"]
 
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    # Normalization
+    scaler = StandardScaler()
+    features = scaler.fit_transform(features)
 
-    # Fit the Kalman Filter to the training data
-    model.eval()
-    with torch.no_grad():
-        training_outputs = model(X_train.unsqueeze(0))
-        kf.em(training_outputs.detach().numpy(), n_iter=10)
+    # Tensors
+    features_tensor = torch.tensor(features, dtype=torch.float32)
+    labels_tensor = torch.tensor(labels.values, dtype=torch.float32)
 
-    train_losses, val_losses, train_maes, val_maes = [], [], [], []
-    filtered_train_losses, filtered_val_losses, filtered_train_maes, filtered_val_maes = [], [], [], []
-    # Training
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        running_mae = 0.0
-        num_batches = 0
-        for batch_features, batch_labels in train_dataloader:
-            model.train()
-            loss, mae = calculate_loss_and_mae(model, criterion, mae_criterion, batch_features, batch_labels)
-            filtered_loss, filtered_mae = calculate_loss_and_mae(model, criterion, mae_criterion, batch_features, batch_labels, use_kalman_filter=True)
+    for train_index, test_index in tscv.split(features_tensor):
+        # Splitting data into train, val and test
+        X_train_val, X_test = features_tensor[train_index], features_tensor[test_index]
+        y_train_val, y_test = labels_tensor[train_index], labels_tensor[test_index]
+        
+        # Validation set
+        X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.2, shuffle=False)
+
+        for window_size in window_sizes:
+            # DataLoader for online learning
+            # TensorDataset from data
+            train_dataset = TensorDataset(X_train[:len(X_train)//window_size*window_size], y_train[:len(y_train)//window_size*window_size])
+            # DataLoader from TensorDataset
+            train_dataloader = DataLoader(train_dataset, batch_size=window_size, shuffle=False)
+
+            # Model's instance with best params
+            model = StressLSTM(input_size, hidden_size, num_layers, dropout_rate_1, dropout_rate_2, dropout_rate_fc)
+
+            optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+            # Fit the Kalman Filter to the training data
+            model.eval()
+            with torch.no_grad():
+                training_outputs = model(X_train.unsqueeze(0))
+                kf.em(training_outputs.detach().numpy(), n_iter=10)
+
+            train_losses, val_losses, train_maes, val_maes = [], [], [], []
+            filtered_train_losses, filtered_val_losses, filtered_train_maes, filtered_val_maes = [], [], [], []
+            # Training
+            for epoch in range(num_epochs):
+                running_loss = 0.0
+                running_mae = 0.0
+                num_batches = 0
+                for batch_features, batch_labels in train_dataloader:
+                    model.train()
+                    loss, mae = calculate_loss_and_mae(model, criterion, mae_criterion, batch_features, batch_labels)
+                    filtered_loss, filtered_mae = calculate_loss_and_mae(model, criterion, mae_criterion, batch_features, batch_labels, use_kalman_filter=True)
+                    
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                
+                    running_loss += loss.item()
+                    running_mae += mae.item()
+                    num_batches += 1
+                
+                average_train_loss = running_loss / num_batches
+                average_train_mae = running_mae / num_batches
+                train_losses.append(average_train_loss)
+                train_maes.append(average_train_mae)
+                filtered_train_losses.append(filtered_loss.item())
+                filtered_train_maes.append(filtered_mae.item())
+
+                # Evaluation
+                model.eval()
+                with torch.no_grad():
+                    val_loss, val_mae = calculate_loss_and_mae(model, criterion, mae_criterion, X_val, y_val)
+                    val_filtered_loss, val_filtered_mae = calculate_loss_and_mae(model, criterion, mae_criterion, X_val, y_val, use_kalman_filter=True)
+                
+                val_losses.append(val_loss.item())
+                val_maes.append(val_mae.item())
+                filtered_val_losses.append(val_filtered_loss.item())
+                filtered_val_maes.append(val_filtered_mae.item())
+                
+                # Test
+                model.eval()
+                with torch.no_grad():
+                    test_loss, test_mae = calculate_loss_and_mae(model, criterion, mae_criterion, X_test, y_test)
+                    test_filtered_loss, test_filtered_mae = calculate_loss_and_mae(model, criterion, mae_criterion, X_test, y_test, use_kalman_filter=True)
+                
+                losses.append(test_loss.item())
+                maes.append(test_mae.item())
+                filtered_losses.append(test_filtered_loss.item())
+                filtered_maes.append(test_filtered_mae.item())
             
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        
-            running_loss += loss.item()
-            running_mae += mae.item()
-            num_batches += 1
-        
-        average_train_loss = running_loss / num_batches
-        average_train_mae = running_mae / num_batches
-        train_losses.append(average_train_loss)
-        train_maes.append(average_train_mae)
-        filtered_train_losses.append(filtered_loss.item())
-        filtered_train_maes.append(filtered_mae.item())
-
-        # Evaluation
-        model.eval()
-        with torch.no_grad():
-            val_loss, val_mae = calculate_loss_and_mae(model, criterion, mae_criterion, X_val, y_val)
-            val_filtered_loss, val_filtered_mae = calculate_loss_and_mae(model, criterion, mae_criterion, X_val, y_val, use_kalman_filter=True)
-        
-        val_losses.append(val_loss.item())
-        val_maes.append(val_mae.item())
-        filtered_val_losses.append(val_filtered_loss.item())
-        filtered_val_maes.append(val_filtered_mae.item())
-        
-        # Test
-        model.eval()
-        with torch.no_grad():
-            test_loss, test_mae = calculate_loss_and_mae(model, criterion, mae_criterion, X_test, y_test)
-            test_filtered_loss, test_filtered_mae = calculate_loss_and_mae(model, criterion, mae_criterion, X_test, y_test, use_kalman_filter=True)
-        
-        losses.append(test_loss.item())
-        maes.append(test_mae.item())
-        filtered_losses.append(test_filtered_loss.item())
-        filtered_maes.append(test_filtered_mae.item())
-    
-    all_train_losses.append(train_losses)
-    all_val_losses.append(val_losses)
-    all_train_maes.append(train_maes)
-    all_val_maes.append(val_maes)
-    all_filtered_train_losses.append(filtered_train_losses)
-    all_filtered_val_losses.append(filtered_val_losses)
-    all_filtered_train_maes.append(filtered_train_maes)
-    all_filtered_val_maes.append(filtered_val_maes)
-
+            all_train_losses.append(train_losses)
+            all_val_losses.append(val_losses)
+            all_train_maes.append(train_maes)
+            all_val_maes.append(val_maes)
+            all_filtered_train_losses.append(filtered_train_losses)
+            all_filtered_val_losses.append(filtered_val_losses)
+            all_filtered_train_maes.append(filtered_train_maes)
+            all_filtered_val_maes.append(filtered_val_maes)
+            
 def fill_lists(loss) :
     # Find max len
     max_len = max(len(lst) for lst in loss)
